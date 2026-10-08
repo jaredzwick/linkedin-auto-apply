@@ -114,11 +114,16 @@ class EasyApplyBot:
         self.browser.get("https://www.linkedin.com/login?trk=guest_homepage-basic_nav-header-signin")
         try:
             user_field = self.wait.until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, 'input[type="email"]'))
+                EC.element_to_be_clickable((By.CSS_SELECTOR, 'input[type="email"]'))
             )
-            pw_field = self.browser.find_element(By.CSS_SELECTOR, 'input[type="password"]')
+            self.browser.execute_script("arguments[0].scrollIntoView({block:'center'});", user_field)
+            user_field.click()
             user_field.send_keys(username)
             time.sleep(1)
+            pw_field = self.wait.until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, 'input[type="password"]'))
+            )
+            pw_field.click()
             pw_field.send_keys(password)
             time.sleep(1)
             pw_field.send_keys(Keys.ENTER)
