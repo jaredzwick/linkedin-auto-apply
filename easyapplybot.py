@@ -114,22 +114,39 @@ class EasyApplyBot:
         self.browser.get("https://www.linkedin.com/login?trk=guest_homepage-basic_nav-header-signin")
         try:
             user_field = self.wait.until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, 'input[type="email"]'))
+                EC.presence_of_element_located((By.CSS_SELECTOR, 'input[type="email"]'))
             )
             self.browser.execute_script("arguments[0].scrollIntoView({block:'center'});", user_field)
-            user_field.click()
+            self.browser.execute_script("arguments[0].focus();", user_field)
             user_field.send_keys(username)
             time.sleep(1)
             pw_field = self.wait.until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, 'input[type="password"]'))
+                EC.presence_of_element_located((By.CSS_SELECTOR, 'input[type="password"]'))
             )
-            pw_field.click()
+            self.browser.execute_script("arguments[0].focus();", pw_field)
             pw_field.send_keys(password)
             time.sleep(1)
-            pw_field.send_keys(Keys.ENTER)
+            sign_in_btn = self.wait.until(
+                EC.element_to_be_clickable((
+                    By.XPATH,
+                    '//button[.//span[normalize-space()="Sign in"] or normalize-space()="Sign in"]',
+                ))
+            )
+            try:
+                sign_in_btn.click()
+            except Exception:
+                self.browser.execute_script("arguments[0].click();", sign_in_btn)
             time.sleep(3)
         except TimeoutException:
             log.info("TimeoutException! Username/password field or login button not found")
+            log.info(f"Current URL: {self.browser.current_url}")
+            try:
+                os.makedirs("./logs", exist_ok=True)
+                shot_path = f"./logs/login_fail_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+                self.browser.save_screenshot(shot_path)
+                log.info(f"Saved screenshot: {shot_path}")
+            except Exception as e:
+                log.info(f"Failed to save screenshot: {e}")
 
     def fill_data(self) -> None:
         self.browser.set_window_size(1, 1)
