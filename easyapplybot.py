@@ -1,4 +1,4 @@
-import time, random, os, csv, platform
+import time, random, os, csv, platform, argparse, sys
 import logging
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -73,11 +73,14 @@ class EasyApplyBot:
                  uploads={},
                  filename='output.csv',
                  blacklist=[],
-                 blackListTitles=[]) -> None:
+                 blackListTitles=[],
+                 dry_run: bool = True,
+                 daily_cap: int = 25) -> None:
 
         log.info("Welcome to Easy Apply Bot")
         dirpath: str = os.getcwd()
         log.info("current directory is : " + dirpath)
+        log.info(f"Mode: {'DRY-RUN (no submits)' if dry_run else 'LIVE'}  Daily cap: {daily_cap}")
 
         self.uploads = uploads
         past_ids: list | None = self.get_appliedIDs(filename)
@@ -88,6 +91,9 @@ class EasyApplyBot:
         self.wait = WebDriverWait(self.browser, 30)
         self.blacklist = blacklist
         self.blackListTitles = blackListTitles
+        self.dry_run = dry_run
+        self.daily_cap = daily_cap
+        self.submitted_today = 0
         self.start_linkedin(username, password)
         self.phone_number = phone_number
         self.checked_invalid = False
@@ -180,6 +186,7 @@ class EasyApplyBot:
             except Exception:
                 self.browser.execute_script("arguments[0].click();", sign_in_btn)
             time.sleep(3)
+            self._handle_post_login()
         except TimeoutException:
             log.info("TimeoutException! Username/password field or login button not found")
             log.info(f"Current URL: {self.browser.current_url}")
@@ -191,9 +198,39 @@ class EasyApplyBot:
             except Exception as e:
                 log.info(f"Failed to save screenshot: {e}")
 
+    def _handle_post_login(self) -> None:
+        """Detect LinkedIn security checkpoints and pause for human handoff."""
+        url = self.browser.current_url
+        log.info(f"Post-login URL: {url}")
+        checkpoint_markers = ("/checkpoint/", "/uas/consumer-protection", "/authwall")
+        if any(m in url for m in checkpoint_markers):
+            os.makedirs("./logs", exist_ok=True)
+            shot = f"./logs/checkpoint_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+            try:
+                self.browser.save_screenshot(shot)
+            except Exception:
+                pass
+            log.warning(
+                "LinkedIn security checkpoint detected. "
+                "Complete the verification in the browser window, then press Enter here to continue."
+            )
+            log.warning(f"Screenshot: {shot}  URL: {url}")
+            try:
+                input("Press Enter after you've cleared the checkpoint...")
+            except EOFError:
+                log.error("No TTY available for checkpoint handoff; aborting.")
+                sys.exit(2)
+            log.info(f"Resumed. Current URL: {self.browser.current_url}")
+
     def fill_data(self) -> None:
-        self.browser.set_window_size(1, 1)
-        self.browser.set_window_position(2000, 2000)
+        # Previously shrank window to 1x1 and parked it off-screen. That broke
+        # every is_displayed() visibility check and is a classic bot signal.
+        # Keep the window at a normal human resolution.
+        try:
+            self.browser.set_window_size(1440, 900)
+            self.browser.set_window_position(0, 0)
+        except Exception:
+            pass
 
     def start_apply(self, positions, locations) -> None:
         start: float = time.time()
@@ -459,10 +496,22 @@ class EasyApplyBot:
                             log.info(e)
 
                     if button:
+                        is_submit_step = i in (3, 4)
+                        if is_submit_step and self.dry_run:
+                            log.info("DRY-RUN: skipping Submit application click")
+                            submitted = True
+                            break
+                        if is_submit_step and self.submitted_today >= self.daily_cap:
+                            log.warning(
+                                f"Daily cap reached ({self.submitted_today}/{self.daily_cap}); "
+                                "not submitting."
+                            )
+                            return False
                         button.click()
                         time.sleep(random.uniform(1.5, 2.5))
-                        if i in (3, 4):
+                        if is_submit_step:
                             submitted = True
+                            self.submitted_today += 1
                         if i != 2:
                             break
                 # if button == None:
@@ -485,23 +534,17 @@ class EasyApplyBot:
         return submitted
 
     def fill_invalids(self):
-        # self.checked_invalid = True
-        text_inputs = self.browser.find_elements(By.XPATH, '//input[contains(@class, "fb-dash-form-element")]')
-        for input in text_inputs:
-            input.clear()
-            input.send_keys('3')
-
-        time.sleep(1)         
-        # todo: don't select yes for requiring visa....
-        radio_inputs = self.browser.find_elements(By.XPATH, '//input[@data-test-text-selectable-option__input="Yes"]')
-        for input in radio_inputs:
-            loc = input.location
-            element_to_click = driver.execute_script(
-                "return document.elementFromPoint(arguments[0], arguments[1]);",
-                loc['x'],
-                loc['y'])
-            element_to_click.click()
-        time.sleep(1)
+        # Historically this typed "3" into every unknown input and clicked "Yes"
+        # on every radio — including visa sponsorship / clearance questions. That
+        # ships garbage answers at scale and gets candidates auto-rejected.
+        # Until we have a real per-question dispatcher, refuse to auto-answer and
+        # let the caller skip the job instead.
+        log.warning(
+            "fill_invalids() invoked but auto-answering is disabled. "
+            "Skipping this application; it has questions we can't answer confidently."
+        )
+        self.checked_invalid = True
+        return
 
         try:
             select_inputs = self.browser.find_elements(By.CSS_SELECTOR, 'select[aria-required="true"]')
@@ -550,15 +593,10 @@ class EasyApplyBot:
         return page
 
     def avoid_lock(self) -> None:
-        pyautogui.FAILSAFE = False
-        x, _ = pyautogui.position()
-        pyautogui.moveTo(x + 200, pyautogui.position().y, duration=1.0)
-        pyautogui.moveTo(x, pyautogui.position().y, duration=0.5)
-        pyautogui.keyDown('ctrl')
-        pyautogui.press('esc')
-        pyautogui.keyUp('ctrl')
-        time.sleep(0.5)
-        pyautogui.press('esc')
+        # Prior version drove the real mouse and pressed Ctrl+Esc, hijacking the
+        # user's keyboard mid-run. If you need to keep the machine awake, use
+        # `caffeinate -di` (macOS) or `systemd-inhibit` (Linux) around the run.
+        return
 
     def next_jobs_page(self, position, location, jobs_per_page):
         self.browser.get(
@@ -574,6 +612,19 @@ class EasyApplyBot:
 
 
 if __name__ == '__main__':
+
+    parser = argparse.ArgumentParser(description="LinkedIn Easy Apply bot")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", dest="dry_run", action="store_true",
+                      help="Walk the flow but never click Submit (default)")
+    mode.add_argument("--live", dest="dry_run", action="store_false",
+                      help="Actually submit applications")
+    parser.set_defaults(dry_run=True)
+    parser.add_argument("--daily-cap", type=int, default=25,
+                        help="Max submissions per run (default 25)")
+    parser.add_argument("--exit-after-login", action="store_true",
+                        help="Log in, then exit — used to verify login flow")
+    args = parser.parse_args()
 
     with open("./config.yaml", 'r') as stream:
         try:
@@ -609,8 +660,18 @@ if __name__ == '__main__':
                        uploads=uploads,
                        filename=output_filename,
                        blacklist=blacklist,
-                       blackListTitles=blackListTitles
+                       blackListTitles=blackListTitles,
+                       dry_run=args.dry_run,
+                       daily_cap=args.daily_cap,
                        )
+
+    if args.exit_after_login:
+        log.info(f"--exit-after-login set; current URL: {bot.browser.current_url}; exiting.")
+        try:
+            bot.browser.quit()
+        except Exception:
+            pass
+        sys.exit(0)
 
     locations: list = [l for l in parameters['locations'] if l != None]
     positions: list = [p for p in parameters['positions'] if p != None]
