@@ -150,6 +150,3 @@ states.json
 logs
 
 output.csv
-
-# Local secrets — never commit
-config.yaml
