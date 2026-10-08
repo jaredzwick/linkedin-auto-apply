@@ -109,28 +109,71 @@ class EasyApplyBot:
             log.info(str(e) + "   jobIDs could not be loaded from CSV {}".format(filename))
             return None
 
+    def _find_visible(self, by, selector: str, timeout: int = 30):
+        end = time.time() + timeout
+        while time.time() < end:
+            for el in self.browser.find_elements(by, selector):
+                try:
+                    if el.is_displayed() and el.is_enabled():
+                        return el
+                except Exception:
+                    continue
+            time.sleep(0.5)
+        raise TimeoutException(f"No visible element for: {selector}")
+
+    def _find_visible_input(self, selectors: list, timeout: int = 30):
+        end = time.time() + timeout
+        while time.time() < end:
+            for sel in selectors:
+                for el in self.browser.find_elements(By.CSS_SELECTOR, sel):
+                    try:
+                        if el.is_displayed() and el.is_enabled():
+                            return el
+                    except Exception:
+                        continue
+            time.sleep(0.5)
+        raise TimeoutException(f"No visible element matched: {selectors}")
+
+    def _type_into(self, el, text: str) -> None:
+        self.browser.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+        self.browser.execute_script("arguments[0].focus();", el)
+        try:
+            el.send_keys(text)
+        except Exception:
+            self.browser.execute_script(
+                "const el=arguments[0], v=arguments[1];"
+                "const s=Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype,'value').set;"
+                "s.call(el, v);"
+                "el.dispatchEvent(new Event('input',{bubbles:true}));"
+                "el.dispatchEvent(new Event('change',{bubbles:true}));",
+                el, text,
+            )
+
     def start_linkedin(self, username, password) -> None:
         log.info("Logging in.....Please wait :)  ")
         self.browser.get("https://www.linkedin.com/login?trk=guest_homepage-basic_nav-header-signin")
         try:
-            user_field = self.wait.until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, 'input[type="email"]'))
-            )
-            self.browser.execute_script("arguments[0].scrollIntoView({block:'center'});", user_field)
-            self.browser.execute_script("arguments[0].focus();", user_field)
-            user_field.send_keys(username)
+            user_field = self._find_visible_input([
+                'input[autocomplete~="username"]',
+                'input[name="session_key"]',
+                '#username',
+                'input[type="email"]',
+            ])
+            self._type_into(user_field, username)
             time.sleep(1)
-            pw_field = self.wait.until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, 'input[type="password"]'))
-            )
-            self.browser.execute_script("arguments[0].focus();", pw_field)
-            pw_field.send_keys(password)
+            pw_field = self._find_visible_input([
+                'input[autocomplete="current-password"]',
+                'input[name="session_password"]',
+                '#password',
+                'input[type="password"]',
+            ])
+            self._type_into(pw_field, password)
             time.sleep(1)
-            sign_in_btn = self.wait.until(
-                EC.element_to_be_clickable((
-                    By.XPATH,
-                    '//button[.//span[normalize-space()="Sign in"] or normalize-space()="Sign in"]',
-                ))
+            sign_in_btn = self._find_visible(
+                By.XPATH,
+                '//button[@type="submit"'
+                ' or .//span[normalize-space()="Sign in"]'
+                ' or normalize-space()="Sign in"]',
             )
             try:
                 sign_in_btn.click()
