@@ -70,6 +70,7 @@ class EasyApplyBot:
                  username,
                  password,
                  phone_number,
+                 hometown: str = '',
                  uploads={},
                  filename='output.csv',
                  blacklist=[],
@@ -94,6 +95,7 @@ class EasyApplyBot:
         self.dry_run = dry_run
         self.daily_cap = daily_cap
         self.submitted_today = 0
+        self.hometown = hometown
         self.start_linkedin(username, password)
         self.phone_number = phone_number
         self.checked_invalid = False
@@ -564,6 +566,53 @@ class EasyApplyBot:
         except Exception:
             return None, None, info
 
+    def _fill_location_typeahead(self) -> int:
+        """Fill empty location/city typeahead inputs by typing self.hometown
+        and selecting the first autocomplete suggestion.
+
+        Returns the number of fields filled. These inputs don't accept a
+        synthetic value — LinkedIn's SDUI listens for a dropdown click, so we
+        drive real send_keys + ARROW_DOWN + RETURN.
+        """
+        if not self.hometown:
+            return 0
+        js_find = r"""
+        const sels = arguments[0];
+        let modal = null;
+        for (const s of sels.split(',')) { modal = document.querySelector(s.trim()); if (modal) break; }
+        if (!modal) return [];
+        const inputs = Array.from(modal.querySelectorAll('input[type=text]'));
+        return inputs.filter(i => {
+          if (i.value && i.value.trim().length > 0) return false;
+          const label = ((i.getAttribute('aria-label') || '') + ' ' +
+                        (i.getAttribute('placeholder') || '')).toLowerCase();
+          return /(location|city|town)/.test(label);
+        }).map(i => i.id).filter(Boolean);
+        """
+        try:
+            ids = self.browser.execute_script(js_find, self.MODAL_SELECTOR) or []
+        except Exception as e:
+            log.info(f"typeahead scan failed: {e}")
+            return 0
+        filled = 0
+        for input_id in ids:
+            try:
+                el = self.browser.find_element(By.ID, input_id)
+                self.browser.execute_script("arguments[0].scrollIntoView({block:'center'});", el)
+                el.click()
+                el.send_keys(self.hometown)
+                # Wait for the suggestion dropdown to render.
+                time.sleep(1.2)
+                el.send_keys(Keys.ARROW_DOWN)
+                time.sleep(0.3)
+                el.send_keys(Keys.RETURN)
+                time.sleep(0.5)
+                filled += 1
+                log.info(f"Typeahead-filled location input {input_id} with '{self.hometown}'")
+            except Exception as e:
+                log.info(f"typeahead fill failed for {input_id}: {e}")
+        return filled
+
     def _auto_fill_modal(self) -> int:
         """Fill unanswered required fields in the modal with conservative defaults.
 
@@ -786,7 +835,10 @@ class EasyApplyBot:
                 log.info(f"Step {step}: action='{kind}' aria='{info.get('aria')}' text='{info.get('text')}'")
 
                 # Fill any unanswered fields before trying to advance.
-                filled = self._auto_fill_modal()
+                # Location typeahead must run first — it drives real keystrokes
+                # and expects a settled dropdown, so can't share the JS pass.
+                typeahead_filled = self._fill_location_typeahead()
+                filled = typeahead_filled + self._auto_fill_modal()
                 if filled > 0:
                     log.info(f"Step {step}: auto-filled {filled} field(s); re-checking action button.")
                     time.sleep(0.5)
@@ -988,9 +1040,16 @@ if __name__ == '__main__':
     for key in uploads.keys():
         assert uploads[key] != None
 
+    hometown_raw = parameters.get('hometown', '')
+    if isinstance(hometown_raw, list):
+        hometown = next((h for h in hometown_raw if h), '')
+    else:
+        hometown = hometown_raw or ''
+
     bot = EasyApplyBot(parameters['username'],
                        parameters['password'],
                        parameters['phone_number'],
+                       hometown=hometown,
                        uploads=uploads,
                        filename=output_filename,
                        blacklist=blacklist,

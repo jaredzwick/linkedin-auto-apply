@@ -11,6 +11,9 @@ locations:
   - Remote
   -  # A second location you want to search in
 
+hometown:
+  -  # Your city, used to fill LinkedIn's "Location (city)" typeahead
+
 # --------- Optional Parameters -------
 # uploads:
 #  Resume: # PATH TO Resume
