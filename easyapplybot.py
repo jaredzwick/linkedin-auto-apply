@@ -265,52 +265,55 @@ class EasyApplyBot:
         self.browser, _ = self.next_jobs_page(position, location, jobs_per_page)
         log.info("Looking for jobs.. Please wait..")
 
+        empty_cycles = 0
         while time.time() - start_time < self.MAX_SEARCH_TIME:
-            print(driver.current_url)
-            if 'linkedin' not in driver.current_url:
-                driver.switch_to.window(driver.window_handles[0])
+            log.debug(f"Current URL: {self.browser.current_url}")
+            if 'linkedin' not in self.browser.current_url:
+                self.browser.switch_to.window(self.browser.window_handles[0])
             try:
                 log.info(f"{(self.MAX_SEARCH_TIME - (time.time() - start_time)) // 60} minutes left in this search")
 
-                # sleep to make sure everything loads, add random to make us look human.
-                randoTime: float = random.uniform(3.5, 4.9)
-                log.debug(f"Sleeping for {round(randoTime, 1)}")
-                time.sleep(randoTime)
-                self.load_page(sleep=1)
-                time.sleep(2)
-                # get job links, (the following are actually the job card objects)
-                links = self.browser.find_elements("xpath",
-                    '//div[@data-job-id]'
-                )
-                if len(links) == 0:
-                    log.debug("No links found")
-                    break
-                IDs: list = []
-                # children selector is the container of the job cards on the left
-                for link in links:
-                    children = link.find_elements("xpath",
-                        '//ul[@class="scaffold-layout__list-container"]'
+                time.sleep(random.uniform(2.0, 3.5))
+                # Scroll the virtualized job-list container so lazy cards render.
+                try:
+                    self.browser.execute_script(
+                        "const sels=['ul.scaffold-layout__list-container','div.jobs-search-results-list','.jobs-search-results__list'];"
+                        "for (const s of sels) { const el=document.querySelector(s); if (el) { el.scrollTop = el.scrollHeight; break; } }"
                     )
-                    for child in children:
-                        if child.text not in self.blacklist:
-                            temp = link.get_attribute("data-job-id")
-                            jobID = temp.split(":")[-1]
-                            IDs.append(int(jobID))
-                jobIDs: list = set(IDs)
+                except Exception:
+                    pass
+                time.sleep(1.0)
 
-                # # remove already applied jobs
-                # before: int = len(IDs)
-                # jobIDs: list = [x for x in IDs if x not in self.appliedJobIDs]
-                # after: int = len(jobIDs)
+                links = self.browser.find_elements(By.XPATH, '//div[@data-job-id]')
+                log.info(f"Found {len(links)} job cards on page")
+                if len(links) == 0:
+                    log.info("No job cards found; ending this search")
+                    break
 
-                # it assumed that 25 jobs are listed in the results window
-                if len(jobIDs) == 0 and len(IDs) > 23:
-                    jobs_per_page = jobs_per_page + 25
+                IDs: list = []
+                for link in links:
+                    jid = link.get_attribute("data-job-id") or ""
+                    jid = jid.strip()
+                    if jid.lstrip('-').isdigit():
+                        IDs.append(int(jid))
+
+                # Dedup preserving order, then drop already-applied.
+                seen = set()
+                unique_ids = [x for x in IDs if not (x in seen or seen.add(x))]
+                jobIDs = [j for j in unique_ids if j not in self.appliedJobIDs]
+                log.info(f"Extracted {len(unique_ids)} unique IDs, {len(jobIDs)} new to attempt")
+
+                if not jobIDs:
+                    empty_cycles += 1
+                    log.info(f"No new jobs on page (empty cycle {empty_cycles}); advancing")
+                    if empty_cycles >= 3:
+                        log.warning("3 consecutive empty cycles; moving to next search combo")
+                        break
+                    jobs_per_page += 25
                     count_job = 0
-                    self.avoid_lock()
-                    self.browser, jobs_per_page = self.next_jobs_page(position,
-                                                                    location,
-                                                                    jobs_per_page)
+                    self.browser, jobs_per_page = self.next_jobs_page(position, location, jobs_per_page)
+                    continue
+                empty_cycles = 0
                 # loop over IDs to apply
                 for i, jobID in enumerate(jobIDs):
                     count_job += 1
@@ -354,9 +357,8 @@ class EasyApplyBot:
                         self.browser, jobs_per_page = self.next_jobs_page(position,
                                                                         location,
                                                                         jobs_per_page)
-            except Exception as e:
-                log.error("Exception in main application loop", e)
-                print(e)
+            except Exception:
+                log.exception("Exception in main application loop")
 
     def write_to_file(self, button, jobID, browserTitle, result) -> None:
         def re_extract(text, pattern):
