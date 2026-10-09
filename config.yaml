@@ -1,6 +1,23 @@
+# Either use the legacy single-account fields below, OR define `accounts:` for
+# multiple accounts. If `accounts:` is non-empty, the top-level username/
+# password/phone_number/hometown are ignored.
 username:
 password:
 phone_number:
+hometown:
+  -  # Your city, used to fill LinkedIn's "Location (city)" typeahead
+
+# Multi-account mode — the bot logs in, runs, logs out, and continues with the
+# next account. Each account gets its own daily cap.
+# accounts:
+#   - username: first@example.com
+#     password: ...
+#     phone_number: 5555555555
+#     hometown: San Diego, CA
+#   - username: second@example.com
+#     password: ...
+#     phone_number: 5555555556
+#     hometown: Austin, TX
 
 positions:
   - Data Scientist
@@ -10,9 +27,6 @@ positions:
 locations:
   - Remote
   -  # A second location you want to search in
-
-hometown:
-  -  # Your city, used to fill LinkedIn's "Location (city)" typeahead
 
 # --------- Optional Parameters -------
 # uploads:

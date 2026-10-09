@@ -996,6 +996,25 @@ class EasyApplyBot:
     def finish_apply(self) -> None:
         self.browser.close()
 
+    def logout(self) -> None:
+        """Hit LinkedIn's logout endpoint so the next login lands cleanly."""
+        try:
+            self.browser.get("https://www.linkedin.com/m/logout/")
+            time.sleep(2)
+            # Clear cookies as a belt-and-suspenders for session reuse.
+            self.browser.delete_all_cookies()
+            log.info("Logged out.")
+        except Exception as e:
+            log.info(f"logout failed: {e}")
+
+    def switch_account(self, username, password, phone_number, hometown) -> None:
+        """Log out of the current session and log in as another user."""
+        self.logout()
+        self.phone_number = phone_number
+        self.hometown = hometown
+        self.submitted_today = 0  # fresh cap per account
+        self.start_linkedin(username, password)
+
 
 if __name__ == '__main__':
 
@@ -1020,16 +1039,47 @@ if __name__ == '__main__':
 
     assert len(parameters['positions']) > 0
     assert len(parameters['locations']) > 0
-    assert parameters['username'] is not None
-    assert parameters['password'] is not None
-    assert parameters['phone_number'] is not None
 
     if 'uploads' in parameters.keys() and type(parameters['uploads']) == list:
         raise Exception("uploads read from the config file appear to be in list format" +
                         " while should be dict. Try removing '-' from line containing" +
                         " filename & path")
 
-    log.info({k: parameters[k] for k in parameters.keys() if k not in ['username', 'password']})
+    def _hometown_from(val):
+        if isinstance(val, list):
+            return next((h for h in val if h), '')
+        return val or ''
+
+    # Support both legacy flat shape (top-level username/password/phone_number)
+    # and new multi-account shape (accounts: [...]). Mixed configs favor the
+    # explicit accounts list.
+    raw_accounts = parameters.get('accounts') or []
+    accounts = []
+    for acct in raw_accounts:
+        if not acct:
+            continue
+        if not acct.get('username') or not acct.get('password') or not acct.get('phone_number'):
+            raise Exception(f"accounts entry missing required field: {acct.get('username') or '?'}")
+        accounts.append({
+            'username': acct['username'],
+            'password': acct['password'],
+            'phone_number': acct['phone_number'],
+            'hometown': _hometown_from(acct.get('hometown', '')),
+        })
+    if not accounts:
+        assert parameters.get('username') is not None, "config.yaml needs either `accounts:` or top-level username/password/phone_number"
+        assert parameters.get('password') is not None
+        assert parameters.get('phone_number') is not None
+        accounts = [{
+            'username': parameters['username'],
+            'password': parameters['password'],
+            'phone_number': parameters['phone_number'],
+            'hometown': _hometown_from(parameters.get('hometown', '')),
+        }]
+
+    log.info({k: parameters[k] for k in parameters.keys()
+              if k not in ('username', 'password', 'accounts')})
+    log.info(f"Accounts configured: {[a['username'] for a in accounts]}")
 
     output_filename: list = [f for f in parameters.get('output_filename', ['output.csv']) if f != None]
     output_filename: list = output_filename[0] if len(output_filename) > 0 else 'output.csv'
@@ -1040,16 +1090,11 @@ if __name__ == '__main__':
     for key in uploads.keys():
         assert uploads[key] != None
 
-    hometown_raw = parameters.get('hometown', '')
-    if isinstance(hometown_raw, list):
-        hometown = next((h for h in hometown_raw if h), '')
-    else:
-        hometown = hometown_raw or ''
-
-    bot = EasyApplyBot(parameters['username'],
-                       parameters['password'],
-                       parameters['phone_number'],
-                       hometown=hometown,
+    first = accounts[0]
+    bot = EasyApplyBot(first['username'],
+                       first['password'],
+                       first['phone_number'],
+                       hometown=first['hometown'],
                        uploads=uploads,
                        filename=output_filename,
                        blacklist=blacklist,
@@ -1068,4 +1113,11 @@ if __name__ == '__main__':
 
     locations: list = [l for l in parameters['locations'] if l != None]
     positions: list = [p for p in parameters['positions'] if p != None]
-    bot.start_apply(positions, locations)
+
+    for i, acct in enumerate(accounts):
+        if i > 0:
+            log.info(f"Switching to account: {acct['username']}")
+            bot.switch_account(acct['username'], acct['password'],
+                               acct['phone_number'], acct['hometown'])
+        bot.appliedJobIDs = bot.get_appliedIDs(output_filename) or []
+        bot.start_apply(positions, locations)
