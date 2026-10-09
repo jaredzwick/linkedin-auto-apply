@@ -928,9 +928,14 @@ class EasyApplyBot:
         return
 
     def next_jobs_page(self, position, location, jobs_per_page):
+        # f_AL=true: Easy Apply only (replaces legacy f_LF=f_AL).
+        # f_TPR=r86400: posted in the last 24 hours.
+        # f_WT=2: Remote work type.
         self.browser.get(
-            "https://www.linkedin.com/jobs/search/?f_LF=f_AL&keywords=" +
-            position + location + "&start=" + str(jobs_per_page))
+            "https://www.linkedin.com/jobs/search/?f_AL=true&f_TPR=r86400&f_WT=2"
+            f"&keywords={position}{location}&start={jobs_per_page}"
+            "&origin=JOB_SEARCH_PAGE_JOB_FILTER"
+        )
         self.avoid_lock()
         log.info("Lock avoided.")
         self.load_page()
