@@ -199,28 +199,44 @@ class EasyApplyBot:
                 log.info(f"Failed to save screenshot: {e}")
 
     def _handle_post_login(self) -> None:
-        """Detect LinkedIn security checkpoints and pause for human handoff."""
+        """Detect LinkedIn security checkpoints and pause for human handoff.
+
+        Polls the URL until the checkpoint clears (or times out at 10 min), so
+        this works whether or not we have a TTY.
+        """
+        checkpoint_markers = ("/checkpoint/", "/uas/consumer-protection", "/authwall")
+
+        def on_checkpoint() -> bool:
+            try:
+                return any(m in self.browser.current_url for m in checkpoint_markers)
+            except Exception:
+                return False
+
         url = self.browser.current_url
         log.info(f"Post-login URL: {url}")
-        checkpoint_markers = ("/checkpoint/", "/uas/consumer-protection", "/authwall")
-        if any(m in url for m in checkpoint_markers):
-            os.makedirs("./logs", exist_ok=True)
-            shot = f"./logs/checkpoint_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-            try:
-                self.browser.save_screenshot(shot)
-            except Exception:
-                pass
-            log.warning(
-                "LinkedIn security checkpoint detected. "
-                "Complete the verification in the browser window, then press Enter here to continue."
-            )
-            log.warning(f"Screenshot: {shot}  URL: {url}")
-            try:
-                input("Press Enter after you've cleared the checkpoint...")
-            except EOFError:
-                log.error("No TTY available for checkpoint handoff; aborting.")
-                sys.exit(2)
-            log.info(f"Resumed. Current URL: {self.browser.current_url}")
+        if not on_checkpoint():
+            return
+
+        os.makedirs("./logs", exist_ok=True)
+        shot = f"./logs/checkpoint_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+        try:
+            self.browser.save_screenshot(shot)
+        except Exception:
+            pass
+        log.warning(
+            "LinkedIn security checkpoint detected. "
+            "Clear the challenge in the browser window — I'll auto-resume when the URL changes."
+        )
+        log.warning(f"Screenshot: {shot}  URL: {url}")
+
+        deadline = time.time() + 10 * 60
+        while time.time() < deadline:
+            if not on_checkpoint():
+                log.info(f"Checkpoint cleared. Current URL: {self.browser.current_url}")
+                return
+            time.sleep(3)
+        log.error("Checkpoint not cleared within 10 minutes; aborting.")
+        sys.exit(2)
 
     def fill_data(self) -> None:
         # Previously shrank window to 1x1 and parked it off-screen. That broke
@@ -453,85 +469,396 @@ class EasyApplyBot:
                 
 
 
-    def send_resume(self) -> bool:
-        def is_present(button_locator) -> bool:
-            return len(self.browser.find_elements(button_locator[0],
-                                                  button_locator[1])) > 0
-        def has_errors() -> bool:
-            return len(self.browser.find_elements(By.XPATH, '//*[contains(@type, "error-pebble-icon")]'))
+    # CSS selector that matches the Easy Apply modal container across old & new
+    # LinkedIn UIs. The data-sdui-screen attr is the most reliable anchor on the
+    # current (2026) SDUI build; the others cover older markup and fallbacks.
+    MODAL_SELECTOR = (
+        "[data-sdui-screen*='EasyApply'], "
+        "[data-testid='dialog-content'], "
+        "div.jobs-easy-apply-modal, "
+        "div[role='dialog']"
+    )
 
+    def _dump_modal_state(self, tag: str) -> None:
+        """Save screenshot + modal HTML to logs for inspection."""
+        try:
+            os.makedirs("./logs", exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            shot = f"./logs/{tag}_{ts}.png"
+            html_path = f"./logs/{tag}_{ts}.html"
+            try:
+                self.browser.save_screenshot(shot)
+            except Exception as e:
+                log.info(f"screenshot failed: {e}")
+            try:
+                modal_html = self.browser.execute_script(
+                    "const sels=arguments[0];"
+                    "for (const s of sels.split(',')) {"
+                    "  const el=document.querySelector(s.trim());"
+                    "  if (el) return el.outerHTML;"
+                    "}"
+                    "return document.documentElement.outerHTML;",
+                    self.MODAL_SELECTOR,
+                )
+                with open(html_path, "w", encoding="utf-8") as f:
+                    f.write(modal_html)
+            except Exception as e:
+                log.info(f"html dump failed: {e}")
+            log.info(f"Dumped modal state: {shot} / {html_path}")
+        except Exception as e:
+            log.info(f"_dump_modal_state failure: {e}")
+
+    def _find_modal_action_button(self):
+        """Find the primary action button in the Easy Apply modal.
+
+        Returns (element, kind, info) where kind is one of:
+          'next'   -> Next / Continue to next step
+          'review' -> Review your application
+          'submit' -> Submit application
+          'follow' -> Follow-company checkbox label
+        or (None, None, info) if nothing actionable visible.
+        """
+        js = r"""
+        const sels = arguments[0];
+        let modal = null;
+        for (const s of sels.split(',')) { modal = document.querySelector(s.trim()); if (modal) break; }
+        const root = modal || document;
+        const buttons = Array.from(root.querySelectorAll('button'));
+        const visible = (el) => {
+          const r = el.getBoundingClientRect();
+          const s = window.getComputedStyle(el);
+          return r.width > 0 && r.height > 0 && s.visibility !== 'hidden' && s.display !== 'none' && !el.disabled;
+        };
+        const score = (el) => {
+          const al = (el.getAttribute('aria-label') || '').toLowerCase();
+          const tx = (el.textContent || '').trim().toLowerCase();
+          if (al.includes('submit application') || tx === 'submit application') return 'submit';
+          if (al.includes('review your application') || tx === 'review') return 'review';
+          if (al.includes('continue to next step') || tx === 'next' || tx === 'continue') return 'next';
+          return null;
+        };
+        // Prefer buttons inside a <footer> (modal action bar) when present.
+        const footerButtons = Array.from(root.querySelectorAll('footer button'));
+        const ordered = footerButtons.concat(buttons.filter(b => !footerButtons.includes(b)));
+        for (const b of ordered) {
+          if (!visible(b)) continue;
+          const k = score(b);
+          if (k) {
+            // Stamp a marker so Python can re-locate reliably.
+            b.setAttribute('data-ea-marker', 'action');
+            return {kind: k, text: (b.textContent||'').trim(), aria: b.getAttribute('aria-label'), modalFound: !!modal};
+          }
+        }
+        const followLabel = (modal || document).querySelector("label[for='follow-company-checkbox']");
+        if (followLabel) { followLabel.setAttribute('data-ea-marker','follow'); return {kind: 'follow', text: 'follow', modalFound: !!modal}; }
+        return {kind: null, modalFound: !!modal};
+        """
+        info = self.browser.execute_script(js, self.MODAL_SELECTOR)
+        if not info or not info.get("kind"):
+            return None, None, info or {}
+        kind = info["kind"]
+        marker = "follow" if kind == "follow" else "action"
+        try:
+            el = self.browser.find_element(By.CSS_SELECTOR, f"[data-ea-marker='{marker}']")
+            return el, kind, info
+        except Exception:
+            return None, None, info
+
+    def _auto_fill_modal(self) -> int:
+        """Fill unanswered required fields in the modal with conservative defaults.
+
+        Returns count of fields filled. Covers:
+          - text/number inputs → '3' (most prompts are "years of ..." experience)
+          - Yes/No radios → 'Yes' for positive-eligibility prompts (auth to work,
+            US resident, degree), 'No' for negative prompts (require sponsorship,
+            felony), otherwise 'Yes'
+          - multi-option radios → first option (or decline-to-self-identify)
+          - selects → first non-placeholder option
+        React/SDUI inputs require native 'input'/'change' events, not just a
+        .value assignment, so we dispatch them via native setters.
+        """
+        js = r"""
+        const sels = arguments[0];
+        let modal = null;
+        for (const s of sels.split(',')) { modal = document.querySelector(s.trim()); if (modal) break; }
+        if (!modal) return 0;
+
+        const nativeSetValue = (el, v) => {
+          const proto = el.tagName === 'TEXTAREA'
+            ? window.HTMLTextAreaElement.prototype
+            : el.tagName === 'SELECT'
+              ? window.HTMLSelectElement.prototype
+              : window.HTMLInputElement.prototype;
+          const setter = Object.getOwnPropertyDescriptor(proto, 'value').set;
+          setter.call(el, v);
+          el.dispatchEvent(new Event('input', {bubbles: true}));
+          el.dispatchEvent(new Event('change', {bubbles: true}));
+        };
+
+        let filled = 0;
+
+        // --- Text / number inputs ---
+        for (const input of modal.querySelectorAll('input[type=text], input[type=number], input[inputmode=numeric]')) {
+          if (input.value && input.value.trim().length > 0) continue;
+          const label = (input.getAttribute('aria-label') || '').toLowerCase();
+          let v = '3';
+          if (/salary|compensation|rate|pay|wage/.test(label)) v = '150000';
+          else if (/notice period|notice/.test(label)) v = '2';
+          else if (/zip|postal/.test(label)) v = '92101';
+          else if (/url|website|linkedin|portfolio|github/.test(label)) v = 'https://linkedin.com/in/jareddzwick';
+          else if (/years|how many|yrs/.test(label)) v = '3';
+          nativeSetValue(input, v);
+          filled++;
+        }
+
+        // --- Textareas ---
+        for (const ta of modal.querySelectorAll('textarea')) {
+          if (ta.value && ta.value.trim().length > 0) continue;
+          nativeSetValue(ta, 'See attached resume.');
+          filled++;
+        }
+
+        // --- Radio groups ---
+        const radios = Array.from(modal.querySelectorAll('input[type=radio]'));
+        const groups = {};
+        for (const r of radios) {
+          const n = r.name || r.getAttribute('name') || r.id;
+          (groups[n] = groups[n] || []).push(r);
+        }
+        for (const name of Object.keys(groups)) {
+          const group = groups[name];
+          if (group.some(r => r.checked)) continue;
+          // Find question label — the <p> text just above the fieldset.
+          const fs = group[0].closest('fieldset');
+          const qContainer = fs ? fs.parentElement : group[0].parentElement;
+          const qText = (qContainer ? (qContainer.innerText || '') : '').toLowerCase();
+
+          // Enumerate option labels in order.
+          const optLabels = group.map(r => {
+            const lab = r.closest('div') ? r.closest('div').parentElement.innerText : '';
+            return (lab || '').trim().toLowerCase();
+          });
+
+          const pick = (predicate) => {
+            for (let i = 0; i < optLabels.length; i++) if (predicate(optLabels[i])) return i;
+            return -1;
+          };
+
+          let idx = -1;
+          const isYesNo = optLabels.some(l => l.includes('yes')) && optLabels.some(l => l.includes('no'));
+          if (isYesNo) {
+            // Prompts where "No" is the safer / correct answer.
+            if (/sponsor|visa|h1b|h-1b|require.*visa|need.*sponsor|felony|conviction|criminal/.test(qText)) {
+              idx = pick(l => l.includes('no'));
+            } else {
+              // Default employability answer.
+              idx = pick(l => l.includes('yes'));
+            }
+          } else {
+            // Multi-option: prefer "decline to self identify" / "prefer not" for EEO,
+            // otherwise first option.
+            idx = pick(l => l.includes('decline') || l.includes('prefer not'));
+            if (idx < 0) idx = 0;
+          }
+          if (idx < 0) idx = 0;
+          const chosen = group[idx];
+          chosen.checked = true;
+          chosen.dispatchEvent(new Event('click', {bubbles: true}));
+          chosen.dispatchEvent(new Event('change', {bubbles: true}));
+          // Also click the associated label — some SDUI handlers listen there.
+          const lbl = modal.querySelector(`label[for='${chosen.id}']`);
+          if (lbl) lbl.click();
+          filled++;
+        }
+
+        // --- Selects ---
+        for (const sel of modal.querySelectorAll('select')) {
+          if (sel.value && sel.value.trim().length > 0 && sel.selectedIndex > 0) continue;
+          const opts = Array.from(sel.options);
+          // Skip the placeholder (usually index 0 with empty value).
+          const target = opts.find((o,i) => i > 0 && o.value && o.value.trim().length > 0);
+          if (!target) continue;
+          nativeSetValue(sel, target.value);
+          filled++;
+        }
+
+        // --- Checkboxes (acknowledgments / consent) ---
+        for (const cb of modal.querySelectorAll('input[type=checkbox]')) {
+          if (cb.checked) continue;
+          // Skip the "follow company" checkbox — handled elsewhere, not required.
+          if (cb.id === 'follow-company-checkbox') continue;
+          const lbl = modal.querySelector(`label[for='${cb.id}']`);
+          if (lbl) {
+            lbl.click();
+          } else {
+            cb.checked = true;
+            cb.dispatchEvent(new Event('click', {bubbles: true}));
+            cb.dispatchEvent(new Event('change', {bubbles: true}));
+          }
+          filled++;
+        }
+
+        return filled;
+        """
+        try:
+            return int(self.browser.execute_script(js, self.MODAL_SELECTOR) or 0)
+        except Exception as e:
+            log.info(f"_auto_fill_modal failed: {e}")
+            return 0
+
+    def _has_form_errors(self) -> bool:
+        """Detect validation errors in the modal (old + new SDUI markup)."""
+        js = r"""
+        const sels = arguments[0];
+        let modal = null;
+        for (const s of sels.split(',')) { modal = document.querySelector(s.trim()); if (modal) break; }
+        const root = modal || document;
+        if (root.querySelector('.artdeco-inline-feedback--error')) return true;
+        if (root.querySelector('[type*="error-pebble-icon"]')) return true;
+        if (root.querySelector('[aria-invalid="true"]')) return true;
+        const text = (root.innerText || '').toLowerCase();
+        const needles = ['this field is required', 'invalid input',
+                         'please enter', 'please make', 'please select', 'enter a '];
+        return needles.some(n => text.includes(n));
+        """
+        try:
+            return bool(self.browser.execute_script(js, self.MODAL_SELECTOR))
+        except Exception:
+            return False
+
+    def _dismiss_easy_apply_modal(self) -> None:
+        """Close the modal + discard draft (used when we bail on a job)."""
+        try:
+            close_btns = self.browser.find_elements(By.CSS_SELECTOR, "button[aria-label='Dismiss']")
+            for b in close_btns:
+                if b.is_displayed():
+                    b.click()
+                    time.sleep(0.8)
+                    break
+            discard_btns = self.browser.find_elements(By.XPATH, "//button[.//span[normalize-space()='Discard']]")
+            for b in discard_btns:
+                if b.is_displayed():
+                    b.click()
+                    time.sleep(0.5)
+                    break
+        except Exception as e:
+            log.info(f"modal dismiss failed: {e}")
+
+    def send_resume(self) -> bool:
+        """Walk the Easy Apply modal step-by-step.
+
+        Bounded loop (max MAX_STEPS iterations with per-step wait) so a stuck
+        modal can't spin until Chrome crashes the tab.
+        """
+        MAX_STEPS = 20
+        STEP_WAIT_SEC = 15
+        submitted = False
         try:
             time.sleep(random.uniform(1.5, 2.5))
-            next_locater = (By.CSS_SELECTOR,
-                            "button[aria-label='Continue to next step']")
-            review_locater = (By.CSS_SELECTOR,
-                              "button[aria-label='Review your application']")
-            submit_locater = (By.CSS_SELECTOR,
-                              "button[aria-label='Submit application']")
-            submit_application_locator = (By.CSS_SELECTOR,
-                                          "button[aria-label='Submit application']")
-            error_locator = (By.CLASS_NAME,
-                             "artdeco-inline-feedback__message")
-            follow_locator = (By.CSS_SELECTOR, "label[for='follow-company-checkbox']")
+            # Wait for the modal itself to render before touching anything.
+            try:
+                self.wait.until(EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, self.MODAL_SELECTOR)
+                ))
+            except TimeoutException:
+                log.warning("Easy Apply modal did not open; dumping state and bailing.")
+                self._dump_modal_state("no_modal")
+                return False
 
-            submitted = False
-            while True:
-                button: None = None
-                buttons: list = [next_locater, review_locater, follow_locator,
-                           submit_locater, submit_application_locator]
-                for i, button_locator in enumerate(buttons):
-                    if is_present(button_locator) and not has_errors():
-                        button: None = self.wait.until(EC.element_to_be_clickable(button_locator))
+            last_kind = None
+            same_kind_count = 0
+            for step in range(MAX_STEPS):
+                # Give the modal a moment to settle after a click.
+                deadline = time.time() + STEP_WAIT_SEC
+                button = kind = info = None
+                while time.time() < deadline:
+                    button, kind, info = self._find_modal_action_button()
+                    if button is not None:
+                        break
+                    time.sleep(0.5)
 
-                    if is_present(error_locator):
-                        try:
-                            for element in self.browser.find_elements(error_locator[0],
-                                                                    error_locator[1]):
-                                text = element.text
-                                # if ("Please enter" in text or "Please make" in text or "Enter a" in text) and self.checked_invalid:
-                                #     button = None
-                                #     break
-                                if ("Please enter" in text or "Please make" in text  or "Enter a" in text) and not self.checked_invalid:
-                                    self.fill_invalids()
-                                    #break
-                        except Exception as e:
-                            log.info(e)
+                if button is None:
+                    log.warning(f"Step {step}: no actionable button in modal. info={info}")
+                    self._dump_modal_state(f"no_button_step{step}")
+                    self._dismiss_easy_apply_modal()
+                    return False
 
-                    if button:
-                        is_submit_step = i in (3, 4)
-                        if is_submit_step and self.dry_run:
-                            log.info("DRY-RUN: skipping Submit application click")
-                            submitted = True
-                            break
-                        if is_submit_step and self.submitted_today >= self.daily_cap:
-                            log.warning(
-                                f"Daily cap reached ({self.submitted_today}/{self.daily_cap}); "
-                                "not submitting."
-                            )
-                            return False
-                        button.click()
-                        time.sleep(random.uniform(1.5, 2.5))
-                        if is_submit_step:
-                            submitted = True
-                            self.submitted_today += 1
-                        if i != 2:
-                            break
-                # if button == None:
-                #     self.checked_invalid = False
-                #     log.info("Could not complete submission")
-                #     break
-                if submitted:
-                    self.checked_invalid = False
+                log.info(f"Step {step}: action='{kind}' aria='{info.get('aria')}' text='{info.get('text')}'")
+
+                # Fill any unanswered fields before trying to advance.
+                filled = self._auto_fill_modal()
+                if filled > 0:
+                    log.info(f"Step {step}: auto-filled {filled} field(s); re-checking action button.")
+                    time.sleep(0.5)
+                    button2, kind2, info2 = self._find_modal_action_button()
+                    if button2 is not None:
+                        button, kind, info = button2, kind2, info2
+
+                if self._has_form_errors():
+                    log.warning(f"Step {step}: form errors visible after auto-fill — skipping job.")
+                    self._dump_modal_state(f"form_errors_step{step}")
+                    self._dismiss_easy_apply_modal()
+                    return False
+
+                if kind == "submit":
+                    if self.dry_run:
+                        log.info("DRY-RUN: not clicking Submit; dismissing modal.")
+                        self._dump_modal_state(f"dryrun_submit_step{step}")
+                        self._dismiss_easy_apply_modal()
+                        return True
+                    if self.submitted_today >= self.daily_cap:
+                        log.warning(f"Daily cap reached ({self.submitted_today}/{self.daily_cap}); not submitting.")
+                        self._dismiss_easy_apply_modal()
+                        return False
+
+                # Scroll into view and click.
+                try:
+                    self.browser.execute_script("arguments[0].scrollIntoView({block:'center'});", button)
+                    button.click()
+                except Exception:
+                    try:
+                        self.browser.execute_script("arguments[0].click();", button)
+                    except Exception as e:
+                        log.warning(f"Step {step}: click failed: {e}")
+                        self._dump_modal_state(f"click_fail_step{step}")
+                        return False
+                time.sleep(random.uniform(1.5, 2.5))
+
+                if kind == "submit":
+                    submitted = True
+                    self.submitted_today += 1
                     log.info("Application Submitted")
                     break
 
-            time.sleep(random.uniform(1.5, 2.5))
+                # Guard against being stuck on the same step. If we auto-filled
+                # anything this iteration we made real progress — reset the
+                # counter so the guard doesn't trip the moment the next page
+                # also happens to show a "Next" button.
+                if filled > 0:
+                    same_kind_count = 0
+                elif kind == last_kind:
+                    same_kind_count += 1
+                    if same_kind_count >= 3:
+                        log.warning(f"Stuck on step kind='{kind}' x{same_kind_count}; bailing.")
+                        self._dump_modal_state(f"stuck_{kind}")
+                        self._dismiss_easy_apply_modal()
+                        return False
+                else:
+                    same_kind_count = 0
+                last_kind = kind
 
+            if not submitted and not self.dry_run:
+                log.warning("Exceeded MAX_STEPS without submission.")
+                self._dump_modal_state("max_steps")
+                self._dismiss_easy_apply_modal()
 
         except Exception as e:
-            log.info(e)
-            log.info("cannot apply to this job")
-            raise (e)
+            log.exception("send_resume failed")
+            try:
+                self._dump_modal_state("exception")
+            except Exception:
+                pass
+            raise e
 
         return submitted
 
