@@ -147,6 +147,12 @@ output*.csv
 venv8/
 quickstart.py
 states.json
-logs
+logs/
 
-output.csv
+# Local config with credentials — never commit
+workflow_config.yaml
+
+# ChromeDriver binaries — downloaded by setup, not committed
+chromedriver
+chromedriver.exe
+assets/chromedriver_*
